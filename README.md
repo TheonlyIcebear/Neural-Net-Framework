@@ -19,7 +19,8 @@ And I've learned a lot through much trial and error in the Machine Learning fiel
 
 
 Image classification problem training loss:<br>
-![Image](image.png)
+![image](https://github.com/user-attachments/assets/b28288b5-8901-4b4f-8299-c2c0b0dfaff8)
+
 
 # Features ⚙
  - The model is completely sequential, meaning the output from one layer will only go to a single next layer
