@@ -15,7 +15,7 @@ class Layer:
     def backward(self, input_activations, node_values):
         return node_values, []
 
-    def update(self, optimizer, gradient, descent_values):
+    def update(self, optimizer, gradient, descent_values, learning_rate):
         pass
 
     def save(self):
@@ -90,7 +90,7 @@ class Conv2d(Layer):
 
         self.biases = np.zeros(self.output_shape)
 
-    def update(self, optimizer, gradient, descent_values):
+    def update(self, optimizer, gradient, descent_values, learning_rate):
         if not descent_values is None:
             kernel_descent_values, bias_descent_values = descent_values
 
@@ -100,8 +100,8 @@ class Conv2d(Layer):
 
         kernels_gradient, kernels_biases_gradient = gradient
 
-        self.kernels, new_kernel_descent_values = optimizer.apply_gradient(self.kernels, kernels_gradient, kernel_descent_values)
-        self.biases, new_bias_descent_values = optimizer.apply_gradient(self.biases, kernels_biases_gradient, bias_descent_values)
+        self.kernels, new_kernel_descent_values = optimizer.apply_gradient(self.kernels, kernels_gradient, kernel_descent_values, learning_rate)
+        self.biases, new_bias_descent_values = optimizer.apply_gradient(self.biases, kernels_biases_gradient, bias_descent_values, learning_rate)
 
         return [new_kernel_descent_values, new_bias_descent_values]
 
@@ -167,8 +167,8 @@ class Dense(Layer):
         self.layer[:, -1] = -0
         self.output_shape = self.depth
 
-    def update(self, optimizer, gradient, descent_values):
-        self.layer, new_descent_values = optimizer.apply_gradient(self.layer, gradient, descent_values)
+    def update(self, optimizer, gradient, descent_values, learning_rate):
+        self.layer, new_descent_values = optimizer.apply_gradient(self.layer, gradient, descent_values, learning_rate)
 
         return new_descent_values
 
@@ -235,7 +235,7 @@ class BatchNorm(Layer):
 
         return new_node_values, [gamma_gradient, beta_gradient, input_activations, input_activations**2]
 
-    def update(self, optimizer, gradient, descent_values):
+    def update(self, optimizer, gradient, descent_values, learning_rate):
         dgamma, dbeta, batch_mean, batch_sq_mean = gradient
 
         batch_var = batch_sq_mean - batch_mean ** 2
@@ -249,8 +249,8 @@ class BatchNorm(Layer):
         self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * batch_mean
         self.running_var = self.momentum * self.running_var + (1 - self.momentum) * batch_var
 
-        self.gamma, new_gamma_descent_values = optimizer.apply_gradient(self.gamma, dgamma, gamma_descent_values)
-        self.beta, new_beta_descent_values = optimizer.apply_gradient(self.beta, dbeta, beta_descent_values)
+        self.gamma, new_gamma_descent_values = optimizer.apply_gradient(self.gamma, dgamma, gamma_descent_values, learning_rate)
+        self.beta, new_beta_descent_values = optimizer.apply_gradient(self.beta, dbeta, beta_descent_values, learning_rate)
 
         return [np.array(new_gamma_descent_values), np.array(new_beta_descent_values)]
 
@@ -287,7 +287,7 @@ class Activation(Layer):
         return output_activations
 
     def backward(self, input_activations, node_values):
-        return node_values * self.activation_function(input_activations, deriv=True), []
+        return node_values * self.activation_function(self.output_activations, deriv=True), []
 
     def save(self):
         return [self.activation_function.__name__], None

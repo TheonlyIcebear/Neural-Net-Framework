@@ -5,21 +5,19 @@ from utils.functions import Loss
 from multiprocessing import Manager, Pool
 
 class Network:
-    def __init__(self, model=[], loss_function="mse", optimizer=SGD()):
+    def __init__(self, model=[], loss_function="mse", optimizer=SGD(), scheduler=None):
         self.model = model
         self.loss_function = getattr(Loss, loss_function)
         self.optimizer = optimizer
+        self.scheduler = scheduler
 
         self.optimizer_values = [None] * len(self.model)
-        self.queue = Manager().Queue()
 
     def compile(self):
         input_shape = self.model[0].output_shape.copy()
-        print(input_shape)
         for layer in self.model[1:]:
             layer.initialize(input_shape)
             input_shape = layer.output_shape
-            print(input_shape)
 
     def save(self):
         model_data = []
@@ -50,9 +48,10 @@ class Network:
         self.model = model
 
     def forward(self, activations, training=True):
+        activations = np.array(activations)
+
         for layer in self.model:
             activations = layer.forward(activations, training=training)
-            print(activations.mean())
 
         return activations
 
@@ -87,8 +86,6 @@ class Network:
         for input_data, expected_output in zip(self.xdata[index-tests:index], self.ydata[index-tests:index]):
             model_output = self.forward(input_data)
 
-            print(model_output, expected_output)
-
             gradient, cost = self.backward(model_output, expected_output)
 
             return_list.append(cost)
@@ -118,7 +115,7 @@ class Network:
 
         return summed_array
 
-    def fit(self, xdata, ydata, batch_size, epochs, threads=1):
+    def fit(self, xdata, ydata, batch_size, learning_rate, epochs, threads=1):
         self.batch_size = batch_size
         self.threads = threads
 
@@ -140,7 +137,13 @@ class Network:
 
             indices.append(index)
 
-        for _ in range(iterations):
+        for iteration in range(iterations):
+
+            epoch = (batch_size / len(xdata)) * iteration
+            
+            if self.scheduler:
+                learning_rate = self.scheduler.forward(learning_rate, epoch)
+
             choices = np.random.choice(xdata.shape[0], size=batch_size, replace=False)
             
             self.xdata = xdata[choices]
@@ -160,6 +163,6 @@ class Network:
             gradient = self.average_gradients(gradients)
             del gradients
             for idx, (layer, layer_gradient, descent_values) in enumerate(zip(self.model[1:], gradient, self.optimizer_values)):
-                new_descent_values = layer.update(self.optimizer, layer_gradient, descent_values)
+                new_descent_values = layer.update(self.optimizer, layer_gradient, descent_values, learning_rate)
 
                 self.optimizer_values[idx] = new_descent_values

@@ -5,47 +5,6 @@ import numpy as np
 from functools import partial
 from PIL import Image, ImageTk, ImageDraw
 
-class Processing:
-    def iou(box, boxes):
-        box_top_left = (box[:2] - (box[2:] / 2))
-        box_bottom_right = (box[:2] + (box[2:] / 2))
-
-        boxes_top_left = (boxes[:, :2] - (boxes[:, 2:] / 2))
-        boxes_bottom_right = (boxes[:, :2] + (boxes[:, 2:] / 2))
-
-        top_left_x = np.maximum(box_top_left[0], boxes_top_left[:, 0])
-        top_left_y = np.maximum(box_top_left[1], boxes_top_left[:, 1])
-
-        bottom_right_x = np.minimum(box_bottom_right[0], boxes_bottom_right[:, 0])
-        bottom_right_y = np.minimum(box_bottom_right[1], boxes_bottom_right[:, 1])
-
-        intersection = np.maximum(0, bottom_right_x - top_left_x) * np.maximum(0, bottom_right_y - top_left_y)
-        box_area = (box_bottom_right[0] - box_top_left[0]) * (box_bottom_right[1] - box_top_left[1])
-        boxes_area = (boxes_bottom_right[:, 0] - boxes_top_left[:, 0]) * (boxes_bottom_right[:, 1] - boxes_top_left[:, 1])
-
-        union = box_area + boxes_area - intersection
-        return intersection / (union + 1e-10)
-
-    def draw_boxes(image, points, color):
-        points_count = int(points.shape[0] / 4)
-
-
-        predicted_points = np.array(points.reshape((points_count, 2, 2)))
-
-        draw = ImageDraw.Draw(image)
-
-        dimensions = np.array(image.size).astype(int)
-
-        for center, distances in predicted_points:
-            top_left = (center - (distances / 2)) * dimensions
-            bottom_right = (center + (distances / 2)) * dimensions
-
-            draw.line([(top_left[0], top_left[1]), (bottom_right[0], top_left[1])], fill=color, width=2)
-            draw.line([(top_left[0], bottom_right[1]), (bottom_right[0], bottom_right[1])], fill=color, width=2)
-
-            draw.line([(top_left[0], top_left[1]), (top_left[0], bottom_right[1])], fill=color, width=2)
-            draw.line([(bottom_right[0], top_left[1]), (bottom_right[0], bottom_right[1])], fill=color, width=2)
-
 class Activations:
     @staticmethod
     # @numba.cfunc("float64[:](float64[:], optional(boolean))")
@@ -53,7 +12,7 @@ class Activations:
         if deriv:
             return x * (1 - x)
 
-        return ( 1 / ( 1 + np.exp(-x) ) )
+        return 1 / ( 1 + np.exp(-x) )
 
     @staticmethod
     # @numba.cfunc("float64[:](float64[:], optional(boolean))")
@@ -87,7 +46,7 @@ class Activations:
     @staticmethod
     # @numba.cfunc("float64[:](float64[:], optional(boolean))")
     def lrelu(x, deriv=False):
-        negative_slope = 10 ** -1
+        negative_slope = 10 ** -3
 
         if deriv:
             return 1 * (x > 0) + (negative_slope * (x < 0))
@@ -106,8 +65,7 @@ class Activations:
     # @numba.cfunc("float64[:](float64[:], optional(boolean))")
     def softmax(x, deriv=False):
         if deriv:
-            softmax_output = np.exp(x) / np.sum(np.exp(x))
-            return softmax_output * (1 - softmax_output)
+            return x * (1 - x)
 
         e_x = np.exp(x)
 
@@ -158,7 +116,7 @@ class Loss:
     # @numba.cfunc("float64[:](float64[:], float64[:], optional(boolean))")
     def yolo_loss(outputs, expected_outputs, deriv=False):
         coordinate_weight = 5
-        no_object_weight = 0.5
+        no_object_weight = 0.4
         object_weight = 1
 
         presence_scores = expected_outputs[::5]
