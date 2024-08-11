@@ -107,7 +107,7 @@ if __name__ == "__main__":
         Activation("softmax")
     ]
 
-    network = Network(model, loss_function="cross_entropy", optimizer=Adam(momentum = 0.8, beta_constant = 0.9, learning_rate=0.0001))
+    network = Network(model, loss_function="cross_entropy", optimizer=Adam(momentum = 0.8, beta_constant = 0.9))
     network.compile()
 
     save_file = 'model-training-data.json'
@@ -126,7 +126,7 @@ if __name__ == "__main__":
     val_costs = []
     plt.ion()
 
-    for idx, cost in enumerate(network.fit(xdata, ydata, batch_size = batch_size, epochs = 200, threads=16)):
+    for idx, cost in enumerate(network.fit(xdata, ydata, learning_rate=0.0001, batch_size = batch_size, epochs = 200, threads=16)):
         print(cost)
 
         # choice = np.random.randint(len(xdata))
@@ -138,7 +138,7 @@ if __name__ == "__main__":
         # val_costs.append(val_loss)
         costs.append(cost)
 
-        plt.plot(np.arange(len(costs)) * (batch_size / (len(xdata) * training_percent)), costs, label='training')
+        plt.plot(np.arange(len(costs)) * (batch_size / len(xdata)), costs, label='training')
         # plt.plot(np.arange(len(val_costs)) * (batch_size / (len(xdata) * training_percent)), val_costs, color='orange', label='validation')
 
         plt.legend()
