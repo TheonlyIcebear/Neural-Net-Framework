@@ -5,9 +5,9 @@ from utils.functions import Loss
 from multiprocessing import Manager, Pool
 
 class Network:
-    def __init__(self, model=[], loss_function="mse", optimizer=SGD(), scheduler=None):
+    def __init__(self, model=[], loss_function=Loss.mse, optimizer=SGD(), scheduler=None):
         self.model = model
-        self.loss_function = getattr(Loss, loss_function)
+        self.loss_function = loss_function
         self.optimizer = optimizer
         self.scheduler = scheduler
 
@@ -15,9 +15,11 @@ class Network:
 
     def compile(self):
         input_shape = self.model[0].output_shape.copy()
+        print(input_shape)
         for layer in self.model[1:]:
             layer.initialize(input_shape)
             input_shape = layer.output_shape
+            print(input_shape)
 
     def save(self):
         model_data = []
