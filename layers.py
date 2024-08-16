@@ -1,4 +1,9 @@
-import scipy, skimage, numpy as np, awkward as ak, time
+import logging, os
+
+logging.disable(logging.WARNING)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+import tensorflow.compat.v1 as tf, skimage, scipy, numpy as np, time
 from utils.functions import Activations
 
 class Layer:
@@ -34,10 +39,18 @@ class Conv2d(Layer):
 
     def forward(self, input_activations, training=True):
         output_activations = self.biases.copy()
-        for i, kernels in enumerate(self.kernels):
-            for kernel, channel in zip(kernels, input_activations):
-                output_activations[i] += scipy.signal.correlate2d(channel, kernel, "valid")
-        
+
+        # for i, kernels in enumerate(self.kernels):
+        #     for kernel, channel in zip(kernels, input_activations):
+        #         output_activations[i] += scipy.signal.correlate2d(channel, kernel, "valid")
+
+        output_activations += tf.nn.conv2d(
+            input_activations.reshape(*input_activations.shape, -1).T, 
+            np.flip(self.kernels.T, (0, 1)), 
+            strides=[1, 1, 1, 1], 
+            padding='VALID'
+        )[0].numpy().T
+
         if training:
             self.output_activations = output_activations
 
@@ -47,13 +60,27 @@ class Conv2d(Layer):
         new_node_values = np.zeros(input_activations.shape)
         kernels_gradient = np.zeros(self.kernels.shape)
 
-        for i, (kernels, kernel_node_values) in enumerate(zip(self.kernels, node_values)):
-            for j, (image, kernel) in enumerate(zip(input_activations, kernels)):
+        # for i, (kernels, kernel_node_values) in enumerate(zip(self.kernels, node_values)):
+        #     for j, (image, kernel) in enumerate(zip(input_activations, kernels)):
+                
+        #         kernels_gradient[i, j] = scipy.signal.correlate2d(image, kernel_node_values, "valid")
+        #         new_node_values[j] += scipy.signal.convolve2d(kernel_node_values, kernel, "full")
 
-                kernels_gradient[i, j] = scipy.signal.correlate2d(image, kernel_node_values, "valid")
-                new_node_values[j] += scipy.signal.convolve2d(kernel_node_values, kernel, "full")
+        new_node_values = tf.nn.conv2d_backprop_input(
+            [1, *input_activations.shape[::-1]],
+            filters = self.kernels.T,
+            out_backprop = node_values.reshape(*node_values.shape, -1).T,
+            strides = [1, 1, 1, 1],
+            padding = "VALID",
+        ).numpy()[0].T
 
-        end_time = time.perf_counter()
+        kernels_gradient = tf.nn.conv2d_backprop_filter(
+            input_activations.reshape(*input_activations.shape, -1).T,
+            self.kernels.shape[::-1],
+            out_backprop = node_values.reshape(*node_values.shape, -1).T,
+            strides = [1, 1, 1, 1],
+            padding = "VALID",
+        ).numpy().T
 
         kernels_biases_gradient = node_values
         return new_node_values, [kernels_gradient, kernels_biases_gradient]
@@ -123,7 +150,11 @@ class Dense(Layer):
         weights = self.layer[:, :-1]
         bias = self.layer[:, -1]
 
+        start_time = time.time()
+
         output = np.dot(weights, input_activations) + bias
+
+        end_time = time.time()
 
         output_activations = output
 
@@ -350,57 +381,47 @@ class MaxPool(Layer):
         self.pooling_shape = np.array(pooling_shape)
 
     def forward(self, input_activations, training=True):
-        result_dimensions = np.ceil(np.array(input_activations.shape[1:]) / self.pooling_shape).astype(int)
-        result_width, result_height = result_dimensions
-
-        depth = input_activations.shape[0]
-
-        output_width, output_height = input_activations.shape[1:]
+        depth, input_width, input_height = input_activations.shape
         pooling_width, pooling_height = self.pooling_shape
-        padded_output = np.pad(input_activations, [(0, 0), (0, output_width % pooling_width), (0, output_height % pooling_height)])
 
-        pooling_windows = skimage.util.view_as_blocks(padded_output, (1, pooling_width, pooling_height)).reshape(depth, -1, pooling_width, pooling_height)
-        output_activations = np.max(pooling_windows, axis=(2, 3)).reshape(depth, *result_dimensions)
+        result_width = (input_width + pooling_width - 1) // pooling_width
+        result_height = (input_height + pooling_height - 1) // pooling_height
 
-        pooling_indices = np.zeros((depth, pooling_windows.shape[1], 2)).astype(int)
+        padded_input = np.pad(input_activations, 
+                              [(0, 0), 
+                               (0, (result_width * pooling_width) - input_width), 
+                               (0, (result_height * pooling_height) - input_height)],
+                              mode='constant')
 
-        flat_windows = pooling_windows.reshape(depth, pooling_windows.shape[1], -1)
-        flat_indices = np.argmax(flat_windows, axis=2)
-        
-        window_height, window_width = pooling_windows.shape[2], pooling_windows.shape[3]
-        rows, cols = np.divmod(flat_indices, window_width)
-        
-        pooling_indices[:, :, 0] = rows
-        pooling_indices[:, :, 1] = cols
-
-        self.pooling_indices = pooling_indices
-
-        del pooling_windows, pooling_indices, flat_windows, flat_indices, padded_output, rows, cols
+        pooling_windows = skimage.util.view_as_blocks(padded_input, (1, pooling_width, pooling_height))
+        pooling_windows = pooling_windows.reshape(depth, result_width * result_height, pooling_width * pooling_height)
+        output_activations = np.max(pooling_windows, axis=2).reshape(depth, result_width, result_height)
 
         if training:
+            self.pooling_indices = np.argmax(pooling_windows, axis=2)
             self.output_activations = output_activations
 
         return output_activations
 
     def backward(self, input_activations, old_node_values):
-        channels, height, width = input_activations.shape
+        depth, input_width, input_height = input_activations.shape
         pooling_width, pooling_height = self.pooling_shape
 
-        start_time = time.perf_counter()
-        
-        unpooled_array = np.zeros_like(input_activations)
+        result_width = (input_width + pooling_width - 1) // pooling_width
+        result_height = (input_height + pooling_height - 1) // pooling_height
 
-        flattened_indices = self.pooling_indices.reshape(channels, -1, 2)
-        x_indices = (flattened_indices[:, :, 0] % pooling_width + (flattened_indices[:, :, 0] // pooling_width) * pooling_width).flatten()
-        y_indices = (flattened_indices[:, :, 1] % pooling_height + (flattened_indices[:, :, 1] // pooling_height) * pooling_height).flatten()
+        unpooled_array = np.zeros((depth, input_width, input_height), dtype=input_activations.dtype)
+        old_node_values_flat = old_node_values.flatten()
 
-        unpooled_array = unpooled_array.flatten()
-        np.add.at(unpooled_array, x_indices + width * y_indices, old_node_values.flatten())
+        flat_indices = self.pooling_indices.flatten()
+        result_x, result_y = np.divmod(flat_indices, pooling_width * pooling_height)
 
-        end_time = time.perf_counter()
-        unpooled_array = unpooled_array.reshape(channels, height, width)
+        x_indices = (result_x % pooling_width + (result_x // pooling_width) * pooling_width).flatten()
+        y_indices = (result_y % pooling_height + (result_y // pooling_height) * pooling_height).flatten()
 
-        return unpooled_array, []
+        np.add.at(unpooled_array.flatten(), x_indices + input_width * y_indices, old_node_values_flat)
+
+        return unpooled_array.reshape(depth, input_width, input_height), []
 
     def initialize(self, input_shape):
         output_shape = input_shape
