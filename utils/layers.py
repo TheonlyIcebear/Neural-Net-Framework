@@ -1,168 +1,437 @@
-import multiprocessing, threading, numpy as np, awkward as ak, utils.layers
-from tqdm.auto import tqdm, trange
-from utils.optimizers import *
-from utils.functions import Loss
-from multiprocessing import Manager, Pool
+import scipy, skimage, numpy as np, awkward as ak, time
+from utils.functions import Activations
 
-class Network:
-    def __init__(self, model=[], loss_function="mse", optimizer=SGD(), scheduler=None):
-        self.model = model
-        self.loss_function = getattr(Loss, loss_function)
-        self.optimizer = optimizer
-        self.scheduler = scheduler
+class Layer:
+    def __init__(self):
+        pass
 
-        self.optimizer_values = [None] * len(self.model)
+    def initialize(self, input_shape):
+        self.output_shape = input_shape
 
-    def compile(self):
-        input_shape = self.model[0].output_shape.copy()
-        for layer in self.model[1:]:
-            layer.initialize(input_shape)
-            input_shape = layer.output_shape
+    def forward(self, input_activations, training=True):
+        self.output_activations = input_activations
+        return self.output_activations
+
+    def backward(self, input_activations, node_values):
+        return node_values, []
+
+    def update(self, optimizer, gradient, descent_values, learning_rate):
+        pass
 
     def save(self):
-        model_data = []
-        for layer in self.model:
-            model_data.append(list(layer.save()) + [layer.__class__.__name__])
+        return [], None
 
-        return [
-            self.optimizer_values,
-            model_data
-        ]
+    def load(self, data):
+        pass
 
-    def load(self, save_data):
-        input_shape = None
 
-        optimizer_values, model_data = save_data
-        self.optimizer_values = optimizer_values
+class Conv2d(Layer):
+    def __init__(self, depth, kernel_shape=[3, 3], stride=1, variance="He"):
+        self.kernel_shape = np.array(kernel_shape)
+        self.variance = variance
+        self.depth = depth
+        self.stride = stride
 
-        model = []
+    def forward(self, input_activations, training=True):
+        output_activations = self.biases.copy()
+        for i, kernels in enumerate(self.kernels):
+            for kernel, channel in zip(kernels, input_activations):
+                output_activations[i] += scipy.signal.correlate2d(channel, kernel, "valid")
+        
+        if training:
+            self.output_activations = output_activations
 
-        for layer_args, layer_data, layer_type in model_data:
-            layer_class = getattr(utils.layers, layer_type)
-            layer = layer_class(*layer_args)
+        return output_activations
 
-            layer.load(layer_data)
+    def backward(self, input_activations, node_values):
+        new_node_values = np.zeros(input_activations.shape)
+        kernels_gradient = np.zeros(self.kernels.shape)
 
-            model.append(layer)
+        for i, (kernels, kernel_node_values) in enumerate(zip(self.kernels, node_values)):
+            for j, (image, kernel) in enumerate(zip(input_activations, kernels)):
 
-        self.model = model
+                kernels_gradient[i, j] = scipy.signal.correlate2d(image, kernel_node_values, "valid")
+                new_node_values[j] += scipy.signal.convolve2d(kernel_node_values, kernel, "full")
 
-    def forward(self, activations, training=True):
-        activations = np.array(activations)
+        end_time = time.perf_counter()
 
-        for layer in self.model:
-            activations = layer.forward(activations, training=training)
+        kernels_biases_gradient = node_values
+        return new_node_values, [kernels_gradient, kernels_biases_gradient]
 
-        return activations
+    def initialize(self, input_shape):
+        input_channels = input_shape[0]
+        output_channels = self.depth
 
-    def backward(self, output, expected_output):
-        expected_output = np.array(expected_output)
-        cost = self.loss_function(output, expected_output).mean()
-        node_values = self.loss_function(output, expected_output, deriv=True)
+        kernel_width, kernel_height = self.kernel_shape
+        fan_in = input_channels * kernel_width * kernel_height
+        fan_out = output_channels * kernel_width * kernel_height
 
-        gradients = [None] * (len(self.model) - 1)
+        output_shape = input_shape
+        output_shape[0] = self.depth
+        output_shape[1:] = (input_shape[1:] - self.kernel_shape + 1) // self.stride
 
-        for idx, layer in enumerate(self.model[::-1][:-1]):
-            current_layer_index = -(idx + 1)
+        self.output_shape = output_shape
 
-            input_activations = self.model[current_layer_index - 1].output_activations
-            node_values, gradient = layer.backward(input_activations, node_values)
-            gradients[current_layer_index] = gradient
+        if (not self.variance) or self.variance == "He":
+            variance = np.sqrt(2 / (fan_in))
+            self.kernels = np.random.normal(0, variance, (output_channels, input_channels, kernel_width, kernel_height))
 
-            del gradient, input_activations
+        elif self.variance == "lecun":
+            variance = np.sqrt(1 / (fan_in))
+            self.kernels = np.random.normal(0, variance, (output_channels, input_channels, kernel_width, kernel_height))
 
-        for layer in self.model[::-1][:-1]:
-            del layer.output_activations
+        elif self.variance == "xavier":
+            variance = np.sqrt(6 / (fan_in + fan_out))
+            self.kernels = np.random.uniform(-variance, variance, (output_channels, input_channels, kernel_width, kernel_height))
 
-        return gradients, cost
+        else:
+            variance = self.variance
+            self.kernels = np.random.uniform(-variance, variance, (output_channels, input_channels, kernel_width, kernel_height))
 
-    def _worker(self, thread_index, index):
-        extra = (1 * (thread_index < (self.batch_size % self.threads))) if self.batch_size % self.threads else 0
-        tests = (self.batch_size // self.threads) + extra
+        self.biases = np.zeros(self.output_shape)
 
-        return_list = []
-        threads = []
+    def update(self, optimizer, gradient, descent_values, learning_rate):
+        if not descent_values is None:
+            kernel_descent_values, bias_descent_values = descent_values
 
-        for input_data, expected_output in zip(self.xdata[index-tests:index], self.ydata[index-tests:index]):
-            model_output = self.forward(input_data)
+        else:
+            kernel_descent_values = None
+            bias_descent_values = None
 
-            gradient, cost = self.backward(model_output, expected_output)
+        kernels_gradient, kernels_biases_gradient = gradient
 
-            return_list.append(cost)
-            return_list.append(gradient)
+        self.kernels, new_kernel_descent_values = optimizer.apply_gradient(self.kernels, kernels_gradient, kernel_descent_values, learning_rate)
+        self.biases, new_bias_descent_values = optimizer.apply_gradient(self.biases, kernels_biases_gradient, bias_descent_values, learning_rate)
 
-            del gradient, model_output
+        return [new_kernel_descent_values, new_bias_descent_values]
 
-        return return_list
+    def save(self):
+        return [self.depth, self.kernel_shape, self.stride, self.variance], [self.kernels, self.biases]
 
-    def average_gradients(self, gradients):
-        summed_array = gradients[0]
+    def load(self, data):
+        self.kernels, self.biases = data
+        self.kernels = np.array(self.kernels)
+        self.biases = np.array(self.biases)
 
-        for gradient in gradients[1:]:
-            for idx, layer in enumerate(gradient):
-                if isinstance(layer, np.ndarray):
-                    summed_array[idx] += layer
-                else:
-                    for count, data in enumerate(layer):
-                        summed_array[idx][count] += data
+class Dense(Layer):
+    def __init__(self, depth, variance="He"):
+        self.variance = variance
+        self.depth = depth
 
-        for idx, layer in enumerate(summed_array):
-            if isinstance(layer, np.ndarray):
-                summed_array[idx] /= self.batch_size
-            else:
-                for count, data in enumerate(layer):
-                    summed_array[idx][count] /= self.batch_size
+    def forward(self, input_activations, training=True):
 
-        return summed_array
+        weights = self.layer[:, :-1]
+        bias = self.layer[:, -1]
 
-    def fit(self, xdata, ydata, batch_size, learning_rate, epochs, threads=1):
+        output = np.dot(weights, input_activations) + bias
+
+        output_activations = output
+
+        if training:
+            self.output_activations = output_activations
+
+        return output_activations
+
+    def backward(self, input_activations, old_node_values):
+        weights = self.layer[:, :-1]
+        biases = self.layer[:, -1]
+
+        gradient = np.zeros(self.layer.shape)
+        new_node_values = np.dot(weights.T, old_node_values)
+
+        weights_derivative = old_node_values[:, None] * input_activations
+        bias_derivative = 1 * old_node_values
+
+        gradient[:, :-1] += weights_derivative
+        gradient[:, -1] += bias_derivative
+
+        return new_node_values, gradient
+
+    def initialize(self, inputs):
+        if (not self.variance) or self.variance == "He":
+            variance = np.sqrt(2 / (inputs))
+            self.layer = np.random.normal(0, variance, (self.depth, inputs + 1))
+
+        elif self.variance == "lecun":
+            variance = np.sqrt(1 / (inputs))
+            self.layer = np.random.normal(0, variance, (self.depth, inputs + 1))
+
+        elif self.variance == "xavier":
+            variance = np.sqrt(6 / (inputs + self.depth))
+            self.layer = np.random.uniform(-variance, variance, (self.depth, inputs + 1))
+
+        else:
+            variance = self.variance
+            self.layer = np.random.uniform(-variance, variance, (self.depth, inputs + 1))
+
+        self.layer[:, -1] = -0
+        self.output_shape = self.depth
+
+    def update(self, optimizer, gradient, descent_values, learning_rate):
+        self.layer, new_descent_values = optimizer.apply_gradient(self.layer, gradient, descent_values, learning_rate)
+
+        return new_descent_values
+
+    def save(self):
+        return [self.depth, self.variance], self.layer
+
+    def load(self, data):
+        self.layer = np.array(data)
+
+class BatchNorm(Layer):
+    def __init__(self, momentum=0.9, batch_size=4):
+        self.momentum = momentum
         self.batch_size = batch_size
-        self.threads = threads
 
-        xdata = np.array(xdata)
-        ydata = np.array(ydata)
+    def forward(self, x, training=True):
+        epsilon = 1e-5
 
-        iterations = int(epochs * (len(xdata) / batch_size))
+        # if training:
+        if x.ndim == 3: 
+            batch_mean = np.mean(x, axis=(1, 2), keepdims=True)
+            batch_var = np.var(x, axis=(1, 2), keepdims=True)
+        elif x.ndim == 1:
+            batch_mean = np.mean(x, axis=0, keepdims=True)
+            batch_var = np.var(x, axis=0, keepdims=True)
 
-        pool = Pool(processes=self.threads)
+        self.x_centered = x - batch_mean
+        self.stddev_inv = 1 / np.sqrt(batch_var + epsilon)
+        x_norm = self.x_centered * self.stddev_inv
+        output_activations = self.gamma * x_norm + self.beta
 
-        indices = []
-        index = 0
+        # else:
+        #     x_norm = (x - self.running_mean) / np.sqrt(self.running_var + epsilon)
+        #     output_activations = self.gamma * x_norm + self.beta
 
-        for thread_index in range(threads):
-            extra = (1 * (thread_index < (self.batch_size % self.threads))) if self.batch_size % self.threads else 0
-            tests = (self.batch_size // self.threads) + extra
+        if training:
+            self.output_activations = output_activations
 
-            index += tests
+        return output_activations
 
-            indices.append(index)
+    def backward(self, input_activations, old_node_values):
+        if input_activations.ndim == 3:  # Convolutional layer (channels, height, width)
+            C, H, W = input_activations.shape
 
-        for iteration in range(iterations):
+            x_norm = self.x_centered * self.stddev_inv
+            beta_gradient = np.sum(old_node_values, axis=(1, 2), keepdims=True)
+            gamma_gradient = np.sum(old_node_values * x_norm, axis=(1, 2), keepdims=True)
 
-            epoch = (batch_size / len(xdata)) * iteration
+            norm_gradient = old_node_values * self.gamma
+            dvar = np.sum(norm_gradient * self.x_centered, axis=(1, 2), keepdims=True) * -0.5 * self.stddev_inv**3
+            dmean = np.sum(norm_gradient * -self.stddev_inv, axis=(1, 2), keepdims=True) + dvar * np.mean(-2. * self.x_centered, axis=(1, 2), keepdims=True)
+            new_node_values = (norm_gradient * self.stddev_inv) + (dvar * 2 * self.x_centered / (self.batch_size * H * W)) + (dmean / (self.batch_size * H * W))
+
+        elif input_activations.ndim == 1:
+            features = input_activations.shape[0]
+
+            x_norm = self.x_centered * self.stddev_inv
+            beta_gradient = np.sum(old_node_values, axis=0)
+            gamma_gradient = np.sum(old_node_values * x_norm, axis=0)
+
+            norm_gradient = old_node_values * self.gamma
+            dvar = np.sum(norm_gradient * self.x_centered, axis=0) * -0.5 * self.stddev_inv**3
+            dmean = np.sum(norm_gradient * -self.stddev_inv, axis=0) + dvar * np.mean(-2. * self.x_centered, axis=0)
+            new_node_values = (norm_gradient * self.stddev_inv) + (dvar * 2 * self.x_centered / self.batch_size) + (dmean / self.batch_size)
+
+        return new_node_values, [gamma_gradient, beta_gradient, input_activations, input_activations**2]
+
+    def update(self, optimizer, gradient, descent_values, learning_rate):
+        dgamma, dbeta, batch_mean, batch_sq_mean = gradient
+
+        batch_var = batch_sq_mean - batch_mean ** 2
+
+        if descent_values is not None:
+            gamma_descent_values, beta_descent_values = descent_values
+        else:
+            gamma_descent_values = None
+            beta_descent_values = None
+
+        self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * batch_mean
+        self.running_var = self.momentum * self.running_var + (1 - self.momentum) * batch_var
+
+        self.gamma, new_gamma_descent_values = optimizer.apply_gradient(self.gamma, dgamma, gamma_descent_values, learning_rate)
+        self.beta, new_beta_descent_values = optimizer.apply_gradient(self.beta, dbeta, beta_descent_values, learning_rate)
+
+        return [np.array(new_gamma_descent_values), np.array(new_beta_descent_values)]
+
+    def initialize(self, input_shape):
+        if isinstance(input_shape, tuple):
+            features = input_shape[0]
+
+        else:
+            features = input_shape
+
+        self.gamma = np.ones(features)
+        self.beta = np.zeros(features)
+        self.running_mean = np.zeros(features)
+        self.running_var = np.ones(features)
+
+        self.output_shape = input_shape
+
+    def save(self):
+        return [self.momentum, self.batch_size], [self.gamma, self.beta, self.running_mean, self.running_var]
+
+    def load(self, data):
+        self.gamma, self.beta, self.running_mean, self.running_var = data
+
+class Activation(Layer):
+    def __init__(self, activation_function):
+        self.activation_function = getattr(Activations, activation_function)
+
+    def forward(self, input_activations, training=True):
+        output_activations = self.activation_function(input_activations)
+
+        if training:
+            self.output_activations = output_activations
+
+        return output_activations
+
+    def backward(self, input_activations, node_values):
+        return node_values * self.activation_function(self.output_activations, deriv=True), []
+
+    def save(self):
+        return [self.activation_function.__name__], None
+
+class Input(Layer):
+    def __init__(self, input_shape):
+        self.output_shape = np.array(input_shape)
+
+    def forward(self, input_activations, training=True):
+        output_activations = input_activations
+
+        if training:
+            self.output_activations = output_activations
+
+        return output_activations
+
+    def save(self):
+        return [self.output_shape], None
+
+class Flatten(Layer):
+    def __init__(self):
+        pass
+
+    def forward(self, input_activations, training=True):
+        output_activations = input_activations.flatten()
+
+        if training:
+            self.output_activations = output_activations
+
+        self.input_shape = input_activations.shape
+        return output_activations
+
+    def backward(self, input_activations, node_values):
+        return node_values.reshape(self.input_shape), []
+
+    def initialize(self, input_shape):
+        self.output_shape = input_shape.prod()
+
+class Reshape(Layer):
+    def __init__(self, output_shape):
+        self.output_shape = output_shape
+
+    def forward(self, input_activations, training=True):
+        output_activations = input_activations.reshape(output_shape)
+
+        if training:
+            self.output_activations = input_activations.reshape(output_shape)
+
+        self.input_shape = input_activations.shape
+        return output_activations
+
+    def backward(self, input_activations, node_values):
+        return node_values.reshape(self.input_shape), []
+
+    def save(self):
+        return [self.output_shape], None
+
+class MaxPool(Layer):
+    def __init__(self, pooling_shape = [2, 2]):
+        self.pooling_shape = np.array(pooling_shape)
+
+    def forward(self, input_activations, training=True):
+        result_dimensions = np.ceil(np.array(input_activations.shape[1:]) / self.pooling_shape).astype(int)
+        result_width, result_height = result_dimensions
+
+        depth = input_activations.shape[0]
+
+        output_width, output_height = input_activations.shape[1:]
+        pooling_width, pooling_height = self.pooling_shape
+        padded_output = np.pad(input_activations, [(0, 0), (0, output_width % pooling_width), (0, output_height % pooling_height)])
+
+        pooling_windows = skimage.util.view_as_blocks(padded_output, (1, pooling_width, pooling_height)).reshape(depth, -1, pooling_width, pooling_height)
+        output_activations = np.max(pooling_windows, axis=(2, 3)).reshape(depth, *result_dimensions)
+
+        pooling_indices = np.zeros((depth, pooling_windows.shape[1], 2)).astype(int)
+
+        flat_windows = pooling_windows.reshape(depth, pooling_windows.shape[1], -1)
+        flat_indices = np.argmax(flat_windows, axis=2)
+        
+        window_height, window_width = pooling_windows.shape[2], pooling_windows.shape[3]
+        rows, cols = np.divmod(flat_indices, window_width)
+        
+        pooling_indices[:, :, 0] = rows
+        pooling_indices[:, :, 1] = cols
+
+        self.pooling_indices = pooling_indices
+
+        del pooling_windows, pooling_indices, flat_windows, flat_indices, padded_output, rows, cols
+
+        if training:
+            self.output_activations = output_activations
+
+        return output_activations
+
+    def backward(self, input_activations, old_node_values):
+        channels, height, width = input_activations.shape
+        pooling_width, pooling_height = self.pooling_shape
+
+        start_time = time.perf_counter()
+        
+        unpooled_array = np.zeros_like(input_activations)
+
+        flattened_indices = self.pooling_indices.reshape(channels, -1, 2)
+        x_indices = (flattened_indices[:, :, 0] % pooling_width + (flattened_indices[:, :, 0] // pooling_width) * pooling_width).flatten()
+        y_indices = (flattened_indices[:, :, 1] % pooling_height + (flattened_indices[:, :, 1] // pooling_height) * pooling_height).flatten()
+
+        unpooled_array = unpooled_array.flatten()
+        np.add.at(unpooled_array, x_indices + width * y_indices, old_node_values.flatten())
+
+        end_time = time.perf_counter()
+        unpooled_array = unpooled_array.reshape(channels, height, width)
+
+        return unpooled_array, []
+
+    def initialize(self, input_shape):
+        output_shape = input_shape
+        output_shape[1:] = np.ceil(output_shape[1:] / self.pooling_shape).astype(int)
+        self.output_shape = output_shape
+
+    def save(self):
+        return [self.pooling_shape], None
+
+class Dropout(Layer):
+    def __init__(self, dropout_rate=0.5):
+        self.dropout_rate = dropout_rate
+        
+    def forward(self, input_activations, training=True):
+        if training:
+            self.mask = (np.random.rand(*input_activations.shape) > self.dropout_rate) / ( 1 - self.dropout_rate)
+        else:
+            self.mask = np.ones(input_activations.shape)
+
+        output_activations = input_activations * self.mask
+
+        if training:
+            self.output_activations = output_activations
             
-            if self.scheduler:
-                learning_rate = self.scheduler.forward(learning_rate, epoch)
+        return output_activations
 
-            choices = np.random.choice(xdata.shape[0], size=batch_size, replace=False)
-            
-            self.xdata = xdata[choices]
-            self.ydata = ydata[choices]
+    def backward(self, input_activations, node_values):
+        return node_values * self.mask, []
 
-            return_data = sum(pool.starmap(self._worker, zip(range(threads), indices)), [])
-            
-            gradients = return_data[1::2]
-            costs = np.array(return_data[::2])
+    def initialize(self, input_shape):
+        self.output_shape = input_shape
 
-            del return_data
-
-            cost = np.mean(costs)
-
-            yield cost
-
-            gradient = self.average_gradients(gradients)
-            del gradients
-            for idx, (layer, layer_gradient, descent_values) in enumerate(zip(self.model[1:], gradient, self.optimizer_values)):
-                new_descent_values = layer.update(self.optimizer, layer_gradient, descent_values, learning_rate)
-
-                self.optimizer_values[idx] = new_descent_values
+    def save(self):
+        return [self.dropout_rate], None
